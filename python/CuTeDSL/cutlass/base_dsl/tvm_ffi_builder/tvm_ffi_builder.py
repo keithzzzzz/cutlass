@@ -668,12 +668,14 @@ class TVMFFIBuilder(MLIRBuilder):
             param_types.append(self.ptr_type)  # p0, p1, ..., pN-1
 
         # Create the helper function
+        # Mark as noinline since error handling is a slow path and benefits from not inlining
         with ir.InsertionPoint(self.module.body):  # type: ignore[union-attr]
             params, entry_block = self.function(
                 name=helper_name,
                 params_type=param_types,
                 ret_type=self.void_type,
                 internal=True,
+                llvm_func_attrs=["noinline"],
             )
 
             kind_param = params[0]
@@ -818,6 +820,7 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
     _fn_call_context: str
     matched_var_binding: dict[spec.Var, ir.Value]
     matched_var_source: dict[spec.Var, ir.Value]
+    matched_var_arg_field_name: dict[spec.Var, str]
 
     def __init__(self, module: ir.Module) -> None:
         super().__init__()
@@ -826,6 +829,7 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
         self._fn_call_context: str = ""
         self.matched_var_binding = {}
         self.matched_var_source = {}
+        self.matched_var_arg_field_name = {}
 
     def find_or_declare_extern_func(
         self, name: str, params: Sequence[ir.Type], ret: ir.Type
@@ -897,6 +901,7 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
                 *arg_context.get(),
                 self._fn_call_context,
             ],
+            arg_context.get_field_name(""),
         )
 
     def decode_param_float(
@@ -1000,6 +1005,7 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
             result = result_block.arguments[0]
             self.matched_var_binding[param] = result
             self.matched_var_source[param] = v_float64
+            self.matched_var_arg_field_name[param] = arg_context.get_field_name("")
 
         return result_block
 
@@ -1054,6 +1060,7 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
             # For opaque handles, we store the pointer directly
             self.matched_var_binding[param] = v_ptr
             self.matched_var_source[param] = v_ptr
+            self.matched_var_arg_field_name[param] = arg_context.get_field_name("")
 
         return current_block
 
@@ -1191,8 +1198,10 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
         var: Union[spec.Var, int],
         value: ir.Value,
         error_msg_context: list[str],
+        arg_field_name: str,
         *,
         skip_check_predicate: Optional[ir.Value] = None,
+        skip_cast_and_check: bool = False,
     ) -> ir.Block:
         """Set or check the matched var binding."""
         error_kind = "ValueError"
@@ -1202,33 +1211,43 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
         if isinstance(var, spec.Var):
             # if var contains llvm_value and is not populated, populate it
             if var not in self.matched_var_binding:
-                current_block = self.check_int_value_dtype_bound(
-                    current_block, value, var.dtype, error_msg_context
-                )
-                # check divisibility if specified
-                if var.divisibility is not None:
-                    current_block = self.check_int_value_divisibility(
-                        current_block, value, var.divisibility, error_msg_context,
-                        skip_check_predicate=skip_check_predicate,
+                if not skip_cast_and_check:
+                    current_block = self.check_int_value_dtype_bound(
+                        current_block, value, var.dtype, error_msg_context
                     )
-                # store the source value with parameter info
-                with ir.InsertionPoint(current_block):
-                    self.matched_var_source[var] = value
-                    self.matched_var_binding[var] = self.downcast_i64_to_lower_bits(
-                        value, var.dtype
-                    )
+                    # check divisibility if specified
+                    if var.divisibility is not None:
+                        current_block = self.check_int_value_divisibility(
+                            current_block, value, var.divisibility, error_msg_context,
+                            skip_check_predicate=skip_check_predicate,
+                        )
+                    # store the source value with parameter info
+                    with ir.InsertionPoint(current_block):
+                        target_value = self.downcast_i64_to_lower_bits(
+                            value, var.dtype
+                        )
+                else:
+                    target_value = value
+                # store the source value
+                self.matched_var_source[var] = value
+                # store the target value (casted to target dtype aleady)
+                self.matched_var_binding[var] = target_value
+                # store arg_field_name
+                self.matched_var_arg_field_name[var] = arg_field_name
                 return current_block
             # otherwise, it appears more than once, we need to check if the value matches
             expected_value = self.matched_var_source[var]
+            prev_arg_field_name = self.matched_var_arg_field_name[var]
             error_msg_mismatch = [
                 error_prefix_mismatch,
                 *error_msg_context,
-                ", symbolic constraint violated"
+                f", expected to match {prev_arg_field_name}",
             ]
         else:
             assert isinstance(var, int)
             with ir.InsertionPoint(current_block):
                 expected_value = self.i64(var)
+
             error_msg_mismatch = [
                 error_prefix_mismatch,
                 *error_msg_context,
@@ -1261,6 +1280,7 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
     ) -> ir.Block:
         """Load the shape value from the argument or match the shape value from the parameter."""
         field_name = arg_context.get_field_name(field_suffix)
+        arg_field_name = f"{field_name}[{shape_index}]"
         error_msg = [
             field_name,
             f"[{shape_index}] ",
@@ -1268,7 +1288,8 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
             self._fn_call_context,
         ]
         return self.set_or_check_matched_var_binding(
-            current_block, var, value, error_msg, skip_check_predicate=skip_check_predicate
+            current_block, var, value, error_msg, arg_field_name,
+            skip_check_predicate=skip_check_predicate
         )
 
     def decode_param_shape_from_ffi_array(
@@ -1553,8 +1574,22 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
         # store the matched values, these do not need constraint checks
         self.matched_var_binding[param.data] = data
         self.matched_var_source[param.data] = param.data
-        self.matched_var_binding[param.device_id] = device_id
-        self.matched_var_source[param.device_id] = param.device_id
+        self.matched_var_arg_field_name[param.data] = arg_context.get_field_name(".data")
+
+        # check device_id constraint if user specifies a device_id variable
+        current_block = self.set_or_check_matched_var_binding(
+            current_block,
+            param.device_id,
+            device_id,
+            [
+                "device index ",
+                *arg_context.get(),
+                self._fn_call_context,
+            ],
+            arg_context.get_field_name(".device.index"),
+            skip_cast_and_check=True,
+        )
+
         # check ndim
         expected_ndim = len(param.shape)
         # Break error message into reusable parts for better string deduplication
@@ -1683,7 +1718,8 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
         """Decode the stream parameter at the given index."""
         # stream is decoded as opaque handle
         return self.decode_param_opaque_handle(
-            current_block, param.var, args, arg_index, arg_context
+            current_block, param.var, args, arg_index, arg_context,
+            allow_int_as_ptr=True
         )
 
     def decode_param_data_pointer(
@@ -1873,6 +1909,7 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
                     )
                 self.matched_var_binding[param.var] = env_stream
                 self.matched_var_source[param.var] = env_stream
+                self.matched_var_arg_field_name[param.var] = param.name
 
         return current_block
 
@@ -1943,13 +1980,21 @@ class TVMFFIFunctionBuilder(TVMFFIBuilder):
             )
 
             # decode parameters to populate the matched var binding
-            for arg_index, param in enumerate(params_list):
+            # Track the actual FFI argument index separately from parameter index
+            # since some parameters (like EnvStream) are not passed as FFI arguments
+            ffi_arg_index = 0
+            for param in params_list:
+                # Skip EnvStream parameters as they are not in the FFI args array
+                if isinstance(param, spec.EnvStream):
+                    continue
+
                 arg_context = ArgContext(
                     param_name=param.name,
-                    arg_index=arg_index,
+                    arg_index=ffi_arg_index,
                     tuple_indices=[],
                 )
-                current_block = self.decode_param(current_block, param, args, arg_index, arg_context)
+                current_block = self.decode_param(current_block, param, args, ffi_arg_index, arg_context)
+                ffi_arg_index += 1
 
             with ir.InsertionPoint(current_block):
                 env_stream = self.find_env_stream(params_list)
@@ -2007,7 +2052,9 @@ def attach_ffi_func(
     builder.attach_ffi_func(symbol_name, params, call_provider, fn_display_name)
 
 
-def rename_tvm_ffi_function(module: ir.Module, old_name: str, new_name: str) -> None:
+def rename_tvm_ffi_function(
+    module: ir.Module, old_name: str, new_name: str,
+) -> None:
     """Rename the TVM FFI function in the module.
 
     Parameters
